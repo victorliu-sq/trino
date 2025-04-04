@@ -22,13 +22,8 @@ import io.trino.operator.window.Framing.Range;
 import io.trino.operator.window.matcher.ArrayView;
 import io.trino.operator.window.matcher.MatchResult;
 import io.trino.operator.window.matcher.Matcher;
-import io.trino.operator.window.pattern.ArgumentComputation;
-import io.trino.operator.window.pattern.LabelEvaluator;
+import io.trino.operator.window.pattern.*;
 import io.trino.operator.window.pattern.LabelEvaluator.Evaluation;
-import io.trino.operator.window.pattern.LogicalIndexNavigation;
-import io.trino.operator.window.pattern.MatchAggregation;
-import io.trino.operator.window.pattern.MeasureComputation;
-import io.trino.operator.window.pattern.ProjectingPagesWindowIndex;
 import io.trino.spi.PageBuilder;
 import io.trino.spi.StandardErrorCode;
 import io.trino.spi.TrinoException;
@@ -46,8 +41,7 @@ import static io.trino.sql.planner.plan.RowsPerMatch.WINDOW;
 import static java.lang.Math.max;
 
 public final class PatternRecognitionPartition
-        implements WindowPartition
-{
+        implements WindowPartition {
     private final PagesIndex pagesIndex;
     private final ProjectingPagesWindowIndex labelEvaluationsIndex;
     private final ProjectingPagesWindowIndex measureComputationsIndex;
@@ -57,15 +51,8 @@ public final class PatternRecognitionPartition
     private final List<WindowFunction> windowFunctions;
     private final PagesHashStrategy peerGroupHashStrategy;
     private final LocalMemoryContext matcherMemoryContext;
-
-    private int peerGroupStart;
-    private int peerGroupEnd;
-
-    private int currentPosition;
-
     // properties for row pattern recognition
     private final List<MeasureComputation> measures;
-
     // an array of all MatchAggregations from all row pattern measures,
     // used to reset the MatchAggregations for every new match.
     // each of MeasureComputations also has access to the MatchAggregations,
@@ -79,7 +66,9 @@ public final class PatternRecognitionPartition
     private final Matcher matcher;
     private final List<Evaluation> labelEvaluations;
     private final AggregatedMemoryContext aggregationsMemoryContext;
-
+    private int peerGroupStart;
+    private int peerGroupEnd;
+    private int currentPosition;
     private int lastSkippedPosition;
     private int lastMatchedPosition;
     private long matchNumber;
@@ -103,8 +92,7 @@ public final class PatternRecognitionPartition
             Matcher matcher,
             List<Evaluation> labelEvaluations,
             List<ArgumentComputation> labelEvaluationsAggregationArguments,
-            List<String> labelNames)
-    {
+            List<String> labelNames) {
         this.pagesIndex = pagesIndex;
         this.partitionStart = partitionStart;
         this.partitionEnd = partitionEnd;
@@ -114,7 +102,7 @@ public final class PatternRecognitionPartition
         this.aggregationsMemoryContext = memoryContext;
         this.matcherMemoryContext = memoryContext.newLocalMemoryContext(Matcher.class.getSimpleName());
         this.measures = ImmutableList.copyOf(measures);
-        this.measureAggregations = measureAggregations.toArray(new MatchAggregation[] {});
+        this.measureAggregations = measureAggregations.toArray(new MatchAggregation[]{});
         this.framing = commonBaseFrame.map(frameInfo -> new RowsFraming(frameInfo, partitionStart, partitionEnd, pagesIndex));
         this.rowsPerMatch = rowsPerMatch;
         this.skipToNavigation = skipToNavigation;
@@ -152,26 +140,22 @@ public final class PatternRecognitionPartition
     }
 
     @Override
-    public int getPartitionStart()
-    {
+    public int getPartitionStart() {
         return partitionStart;
     }
 
     @Override
-    public int getPartitionEnd()
-    {
+    public int getPartitionEnd() {
         return partitionEnd;
     }
 
     @Override
-    public boolean hasNext()
-    {
+    public boolean hasNext() {
         return currentPosition < partitionEnd;
     }
 
     @Override
-    public void processNextRow(PageBuilder pageBuilder)
-    {
+    public void processNextRow(PageBuilder pageBuilder) {
         checkState(hasNext(), "No more rows in partition");
 
         // check for new peer group
@@ -184,8 +168,7 @@ public final class PatternRecognitionPartition
             if (rowsPerMatch == WINDOW) {
                 outputUnmatchedRow(pageBuilder);
             }
-        }
-        else {
+        } else {
             // try match pattern from the current row on
             // 1. determine pattern search boundaries.
             //    - for MATCH_RECOGNIZE, pattern matching and associated computations can involve the whole partition
@@ -199,6 +182,13 @@ public final class PatternRecognitionPartition
                 searchStart = partitionStart + baseRange.getStart();
                 searchEnd = partitionStart + baseRange.getEnd() + 1;
             }
+
+
+            // ------------------------------------------------
+            // Jiaxin: Start timing for all matcher.run calls
+//            long matcherStartTime = System.nanoTime();
+            // ------------------------------------------------
+
             LabelEvaluator labelEvaluator = new LabelEvaluator(matchNumber, patternStart, partitionStart, searchStart, searchEnd, labelEvaluations, labelEvaluationsIndex);
             MatchResult matchResult = matcher.run(labelEvaluator, matcherMemoryContext, aggregationsMemoryContext);
 
@@ -209,29 +199,33 @@ public final class PatternRecognitionPartition
                 matchResult = matcher.run(labelEvaluator, matcherMemoryContext, aggregationsMemoryContext);
             }
 
+            // ------------------------------------------------
+            // Jiaxin:End timing and calculate total execution time
+//            long matcherEndTime = System.nanoTime();
+//            long totalMatcherTimeMs = (matcherEndTime - matcherStartTime) / 1_000_000; // Convert to milliseconds
+//            System.out.println("processNextRow: Total matcher.run execution time for position " + currentPosition + " = " + totalMatcherTimeMs + " ms");
+            // ------------------------------------------------
+
             // produce output depending on match and output mode (rowsPerMatch)
             if (!matchResult.isMatched()) {
                 if (rowsPerMatch == WINDOW || (rowsPerMatch.isUnmatchedRows() && !isMatched(currentPosition))) {
                     outputUnmatchedRow(pageBuilder);
                 }
                 lastSkippedPosition = currentPosition;
-            }
-            else if (matchResult.getLabels().length() == 0) {
+            } else if (matchResult.getLabels().length() == 0) {
                 if (rowsPerMatch.isEmptyMatches()) {
                     outputEmptyMatch(pageBuilder);
                 }
                 lastSkippedPosition = currentPosition;
                 matchNumber++;
-            }
-            else { // non-empty match
+            } else { // non-empty match
                 for (MatchAggregation aggregation : measureAggregations) {
                     aggregation.reset();
                 }
 
                 if (rowsPerMatch.isOneRow()) {
                     outputOneRowPerMatch(pageBuilder, matchResult, patternStart, searchStart, searchEnd);
-                }
-                else {
+                } else {
                     outputAllRowsPerMatch(pageBuilder, matchResult, searchStart, searchEnd);
                 }
                 updateLastMatchedPosition(matchResult, patternStart);
@@ -243,19 +237,16 @@ public final class PatternRecognitionPartition
         currentPosition++;
     }
 
-    private boolean isSkipped(int position)
-    {
+    private boolean isSkipped(int position) {
         return position <= lastSkippedPosition;
     }
 
-    private boolean isMatched(int position)
-    {
+    private boolean isMatched(int position) {
         return position <= lastMatchedPosition;
     }
 
     // the output for unmatched row refers to no pattern match and empty frame.
-    private void outputUnmatchedRow(PageBuilder pageBuilder)
-    {
+    private void outputUnmatchedRow(PageBuilder pageBuilder) {
         // copy output channels
         pageBuilder.declarePosition();
         int channel = 0;
@@ -282,8 +273,7 @@ public final class PatternRecognitionPartition
     }
 
     // the output for empty match refers to empty pattern match and empty frame.
-    private void outputEmptyMatch(PageBuilder pageBuilder)
-    {
+    private void outputEmptyMatch(PageBuilder pageBuilder) {
         // copy output channels
         pageBuilder.declarePosition();
         int channel = 0;
@@ -310,8 +300,7 @@ public final class PatternRecognitionPartition
         }
     }
 
-    private void outputOneRowPerMatch(PageBuilder pageBuilder, MatchResult matchResult, int patternStart, int searchStart, int searchEnd)
-    {
+    private void outputOneRowPerMatch(PageBuilder pageBuilder, MatchResult matchResult, int patternStart, int searchStart, int searchEnd) {
         // copy output channels
         pageBuilder.declarePosition();
         int channel = 0;
@@ -338,8 +327,7 @@ public final class PatternRecognitionPartition
         }
     }
 
-    private void outputAllRowsPerMatch(PageBuilder pageBuilder, MatchResult matchResult, int searchStart, int searchEnd)
-    {
+    private void outputAllRowsPerMatch(PageBuilder pageBuilder, MatchResult matchResult, int searchStart, int searchEnd) {
         // window functions are not allowed with ALL ROWS PER MATCH
         checkState(windowFunctions.isEmpty(), "invalid node: window functions specified with ALL ROWS PER MATCH");
 
@@ -362,8 +350,7 @@ public final class PatternRecognitionPartition
         }
     }
 
-    private void outputRow(PageBuilder pageBuilder, ArrayView labels, int position, int searchStart, int searchEnd)
-    {
+    private void outputRow(PageBuilder pageBuilder, ArrayView labels, int position, int searchStart, int searchEnd) {
         // copy output channels
         pageBuilder.declarePosition();
         int channel = 0;
@@ -379,14 +366,12 @@ public final class PatternRecognitionPartition
         }
     }
 
-    private void updateLastMatchedPosition(MatchResult matchResult, int patternStart)
-    {
+    private void updateLastMatchedPosition(MatchResult matchResult, int patternStart) {
         int lastPositionInMatch = patternStart + matchResult.getLabels().length() - 1;
         lastMatchedPosition = max(lastMatchedPosition, lastPositionInMatch);
     }
 
-    private void skipAfterMatch(MatchResult matchResult, int patternStart, int searchStart, int searchEnd)
-    {
+    private void skipAfterMatch(MatchResult matchResult, int patternStart, int searchStart, int searchEnd) {
         ArrayView labels = matchResult.getLabels();
         switch (skipToPosition) {
             case PAST_LAST:
@@ -412,8 +397,7 @@ public final class PatternRecognitionPartition
         }
     }
 
-    private void updatePeerGroup()
-    {
+    private void updatePeerGroup() {
         peerGroupStart = currentPosition;
         // find end of peer group
         peerGroupEnd = peerGroupStart + 1;

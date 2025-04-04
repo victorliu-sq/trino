@@ -21,17 +21,18 @@ import io.trino.operator.window.pattern.PhysicalValueAccessor;
 import io.trino.sql.planner.LocalExecutionPlanner.MatchAggregationLabelDependency;
 
 import java.util.List;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 import static io.airlift.slice.SizeOf.instanceSize;
 import static io.trino.operator.window.matcher.MatchResult.NO_MATCH;
 
-public class Matcher
+public class ParallelMatcher
 {
     private final Program program;
     private final ThreadEquivalence threadEquivalence;
     private final List<MatchAggregationInstantiator> aggregations;
 
-    protected static class Runtime
+    protected static class ParallelRuntime
     {
         private static final int INSTANCE_SIZE = instanceSize(java.lang.Runtime.class);
 
@@ -52,7 +53,12 @@ public class Matcher
         // for each thread, array of MatchAggregations evaluated by this thread
         private final MatchAggregations aggregations;
 
-        public Runtime(Program program, int inputLength, boolean matchingAtPartitionStart, List<MatchAggregationInstantiator> aggregationInstantiators, AggregatedMemoryContext aggregationsMemoryContext)
+        // Read-write lock for thread safety
+        private final ReentrantReadWriteLock lock;
+        private final ReentrantReadWriteLock.ReadLock readLock;
+        private final ReentrantReadWriteLock.WriteLock writeLock;
+
+        public ParallelRuntime(Program program, int inputLength, boolean matchingAtPartitionStart, List<MatchAggregationInstantiator> aggregationInstantiators, AggregatedMemoryContext aggregationsMemoryContext)
         {
             int initialCapacity = 2 * program.size();
             threads = new IntList(initialCapacity);
@@ -64,35 +70,59 @@ public class Matcher
 
             this.threadsAtInstructions = new IntMultimap(program.size(), program.size());
             this.threadsToKill = new IntList(initialCapacity);
+
+            this.lock = new ReentrantReadWriteLock();
+            readLock = lock.readLock();
+            writeLock = lock.writeLock();
         }
 
         private int forkThread(int parent)
         {
-            int child = newThread();
-            captures.copy(parent, child);
-            aggregations.copy(parent, child);
-            return child;
+            writeLock.lock();
+            try {
+                int child = newThread();
+                captures.copy(parent, child);
+                aggregations.copy(parent, child);
+                return child;
+            } finally {
+                writeLock.unlock();
+            }
         }
 
         private int newThread()
         {
-            if (freeThreadIds.size() > 0) {
-                return freeThreadIds.pop();
+            writeLock.lock();
+            try {
+                if (freeThreadIds.size() > 0) {
+                    return freeThreadIds.pop();
+                }
+                return newThreadId++;
+            } finally {
+                writeLock.unlock();
             }
-            return newThreadId++;
         }
 
         private void scheduleKill(int threadId)
         {
-            threadsToKill.add(threadId);
+            writeLock.lock();
+            try {
+                threadsToKill.add(threadId);
+            } finally {
+                writeLock.unlock();
+            }
         }
 
         private void killThreads()
         {
-            for (int i = 0; i < threadsToKill.size(); i++) {
-                killThread(threadsToKill.get(i));
+            writeLock.lock();
+            try {
+                for (int i = 0; i < threadsToKill.size(); i++) {
+                    killThread(threadsToKill.get(i));
+                }
+                threadsToKill.clear();
+            } finally {
+                writeLock.unlock();
             }
-            threadsToKill.clear();
         }
 
         private void killThread(int threadId)
@@ -104,44 +134,79 @@ public class Matcher
 
         private long getSizeInBytes()
         {
-            return INSTANCE_SIZE + threadsAtInstructions.getSizeInBytes() + threadsToKill.getSizeInBytes() + threads.getSizeInBytes() + freeThreadIds.getSizeInBytes() + captures.getSizeInBytes() + aggregations.getSizeInBytes();
+            readLock.lock();
+            try {
+                return INSTANCE_SIZE + threadsAtInstructions.getSizeInBytes() + threadsToKill.getSizeInBytes() + threads.getSizeInBytes() + freeThreadIds.getSizeInBytes() + captures.getSizeInBytes() + aggregations.getSizeInBytes();
+            } finally {
+                readLock.unlock();
+            }
         }
     }
 
-    public Matcher(Program program, List<List<PhysicalValueAccessor>> accessors, List<MatchAggregationLabelDependency> labelDependencies, List<MatchAggregationInstantiator> aggregations)
+    public ParallelMatcher(Program program, List<List<PhysicalValueAccessor>> accessors, List<MatchAggregationLabelDependency> labelDependencies, List<MatchAggregationInstantiator> aggregations)
     {
         this.program = program;
         this.threadEquivalence = new ThreadEquivalence(program, accessors, labelDependencies);
         this.aggregations = aggregations;
     }
 
+    private void flattenThreadsUntilDone(IntList[] currentThreads,  IntList current, ParallelRuntime runtime, MatchResult matchResult)
+    {
+        boolean isDone = false;
+        for (int gid = 0; gid < currentThreads.length; gid++) {
+            for (int tid = 0; tid < currentThreads[gid].size(); tid++) {
+                int threadId = currentThreads[gid].get(tid);
+                int pointer = runtime.threads.get(threadId); // Use thread-safe getter
+                Instruction instruction = program.at(pointer);
+                if (!isDone) {
+                    // first DONE
+                    if (instruction.type() == Instruction.Type.DONE) {
+                        isDone = true;
+                        matchResult = new MatchResult(true, runtime.captures.getLabels(threadId), runtime.captures.getCaptures(threadId));
+                    } else {
+                        current.add(threadId);
+                    }
+                } else {
+                    runtime.scheduleKill(threadId);
+                }
+
+            }
+        }
+    }
+
     public MatchResult run(LabelEvaluator labelEvaluator, LocalMemoryContext memoryContext, AggregatedMemoryContext aggregationsMemoryContext)
     {
         IntList current = new IntList(program.size());
-        IntList next = new IntList(program.size());
+//        IntList next = new IntList(program.size());
 
         int inputLength = labelEvaluator.getInputLength();
         boolean matchingAtPartitionStart = labelEvaluator.isMatchingAtPartitionStart();
 
-        Runtime runtime = new Runtime(program, inputLength, matchingAtPartitionStart, aggregations, aggregationsMemoryContext);
+        ParallelRuntime runtime = new ParallelRuntime(program, inputLength, matchingAtPartitionStart, aggregations, aggregationsMemoryContext);
 
-        advanceAndSchedule(current, runtime.newThread(), 0, 0, runtime);
+        IntList[] nextThreads = new IntList[1];
+        nextThreads[0] = new IntList(program.size());
+        advanceAndSchedule(nextThreads[0], runtime.newThread(), 0, 0, runtime);
 
+        // flatten the current lists into a single list
         MatchResult result = NO_MATCH;
+        flattenThreadsUntilDone(nextThreads, current, runtime, result);
 
         for (int index = 0; index < inputLength; index++) {
             if (current.size() == 0) {
                 // no match found -- all threads are dead
                 break;
             }
-            boolean matched = false;
+//            boolean matched = false;
             // For every existing thread, consume the label if possible. Otherwise, kill the thread.
             // After consuming the label, advance to the next `MATCH_LABEL`. Collect the advanced threads in `next`,
             // which will be the starting point for the next iteration.
 
             // clear the structure for new input index
-            runtime.threadsAtInstructions.clear();
-            runtime.killThreads();
+//            runtime.threadsAtInstructions.clear();
+//            runtime.killThreads();
+
+            nextThreads = new IntList[current.size()];
 
             for (int i = 0; i < current.size(); i++) {
                 int threadId = current.get(i);
@@ -155,36 +220,43 @@ public class Matcher
                         // - if the condition is false, the thread is killed along with its captures, so the incorrectly saved label does not matter
                         runtime.captures.saveLabel(threadId, label);
                         if (labelEvaluator.evaluateLabel(runtime.captures.getLabels(threadId), runtime.aggregations.get(threadId))) {
-                            advanceAndSchedule(next, threadId, pointer + 1, index + 1, runtime);
+                            advanceAndSchedule(nextThreads[i], threadId, pointer + 1, index + 1, runtime);
                         }
                         else {
                             runtime.scheduleKill(threadId);
                         }
                         break;
-                    case DONE:
-                        matched = true;
-                        result = new MatchResult(true, runtime.captures.getLabels(threadId), runtime.captures.getCaptures(threadId));
-                        runtime.scheduleKill(threadId);
-                        break;
+//                    case DONE:
+//                        matched = true;
+//                        result = new MatchResult(true, runtime.captures.getLabels(threadId), runtime.captures.getCaptures(threadId));
+//                        runtime.scheduleKill(threadId);
+//                        break;
                     default:
                         throw new UnsupportedOperationException("not yet implemented");
                 }
-                if (matched) {
-                    // do not process the following threads, because they are on less preferred paths than the match found
-                    for (int j = i + 1; j < current.size(); j++) {
-                        runtime.scheduleKill(current.get(j));
-                    }
-                    break;
-                }
+//                if (matched) {
+//                    // do not process the following threads, because they are on less preferred paths than the match found
+//                    for (int j = i + 1; j < current.size(); j++) {
+//                        runtime.scheduleKill(current.get(j));
+//                    }
+//                    break;
+//                }
             }
 
             // report memory usage. memory is not reported for constant structures: program, threadEquivalence
-            memoryContext.setBytes(runtime.getSizeInBytes() + current.getSizeInBytes() + next.getSizeInBytes());
+            long nextSize = 0;
+            for (IntList next : nextThreads) {
+                nextSize += next.size();
+            }
+            memoryContext.setBytes(runtime.getSizeInBytes() + current.getSizeInBytes() + nextSize);
 
-            IntList temp = current;
-            temp.clear();
-            current = next;
-            next = temp;
+//            IntList temp = current;
+//            temp.clear();
+//            current = next;
+//            next = temp;
+
+            current.clear();
+            flattenThreadsUntilDone(nextThreads, current, runtime, result);
         }
 
         // handle the case when the program still has instructions to process after consuming the whole input
@@ -205,7 +277,7 @@ public class Matcher
      * The resulting thread state (the pointer of the first not processed instruction) is recorded in `next`.
      * There might be multiple threads recorded in `next`, as a result of the instruction `SPLIT`.
      */
-    private void advanceAndSchedule(IntList next, int threadId, int pointer, int inputIndex, Runtime runtime)
+    private void advanceAndSchedule(IntList next, int threadId, int pointer, int inputIndex, ParallelRuntime runtime)
     {
         // avoid empty loop and try avoid exponential processing
         ArrayView threadsAtInstruction = runtime.threadsAtInstructions.getArrayView(pointer);

@@ -144,6 +144,7 @@ import io.trino.operator.window.PatternRecognitionPartitionerSupplier;
 import io.trino.operator.window.RegularPartitionerSupplier;
 import io.trino.operator.window.matcher.IrRowPatternToProgramRewriter;
 import io.trino.operator.window.matcher.Matcher;
+import io.trino.operator.window.matcher.OptimizedMatcher;
 import io.trino.operator.window.matcher.Program;
 import io.trino.operator.window.pattern.ArgumentComputation.ArgumentComputationSupplier;
 import io.trino.operator.window.pattern.LabelEvaluator.EvaluationSupplier;
@@ -1513,7 +1514,7 @@ public class LocalExecutionPlanner
                     skipToNavigation,
                     node.getSkipToPosition(),
                     node.isInitial(),
-                    new Matcher(program, evaluationsValuePointers.build(), aggregationsLabelDependencies.build(), labelEvaluationsAggregations.build()),
+                    new OptimizedMatcher(program, evaluationsValuePointers.build(), aggregationsLabelDependencies.build(), labelEvaluationsAggregations.build()),
                     labelEvaluations,
                     labelEvaluationsAggregationArguments.build(),
                     labelNames);
