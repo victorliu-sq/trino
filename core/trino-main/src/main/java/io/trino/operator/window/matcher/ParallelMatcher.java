@@ -21,138 +21,27 @@ import io.trino.operator.window.pattern.PhysicalValueAccessor;
 import io.trino.sql.planner.LocalExecutionPlanner.MatchAggregationLabelDependency;
 
 import java.util.List;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 import static io.airlift.slice.SizeOf.instanceSize;
 import static io.trino.operator.window.matcher.MatchResult.NO_MATCH;
 
-public class ParallelMatcher extends Matcher
-{
+public class ParallelMatcher extends Matcher {
     private final Program program;
     private final ThreadEquivalence threadEquivalence;
     private final List<MatchAggregationInstantiator> aggregations;
 
-    protected static class ParallelRuntime
-    {
-        private static final int INSTANCE_SIZE = instanceSize(java.lang.Runtime.class);
-
-        // a helper structure for identifying equivalent threads
-        // program pointer (instruction) --> list of threads that have reached this instruction
-        private final IntMultimap threadsAtInstructions;
-        // threads that should be killed as determined by the current iteration of the main loop
-        // they are killed after the iteration so that they can be used to kill other threads while the iteration lasts
-        private final IntList threadsToKill;
-
-        private final IntList threads;
-        private final IntStack freeThreadIds;
-        private int newThreadId;
-        private final int inputLength;
-        private final boolean matchingAtPartitionStart;
-        private final Captures captures;
-
-        // for each thread, array of MatchAggregations evaluated by this thread
-        private final MatchAggregations aggregations;
-
-        // Read-write lock for thread safety
-        private final ReentrantReadWriteLock lock;
-        private final ReentrantReadWriteLock.ReadLock readLock;
-        private final ReentrantReadWriteLock.WriteLock writeLock;
-
-        public ParallelRuntime(Program program, int inputLength, boolean matchingAtPartitionStart, List<MatchAggregationInstantiator> aggregationInstantiators, AggregatedMemoryContext aggregationsMemoryContext)
-        {
-            int initialCapacity = 2 * program.size();
-            threads = new IntList(initialCapacity);
-            freeThreadIds = new IntStack(initialCapacity);
-            this.captures = new Captures(initialCapacity, program.getMinSlotCount(), program.getMinLabelCount());
-            this.inputLength = inputLength;
-            this.matchingAtPartitionStart = matchingAtPartitionStart;
-            this.aggregations = new MatchAggregations(initialCapacity, aggregationInstantiators, aggregationsMemoryContext);
-
-            this.threadsAtInstructions = new IntMultimap(program.size(), program.size());
-            this.threadsToKill = new IntList(initialCapacity);
-
-            this.lock = new ReentrantReadWriteLock();
-            readLock = lock.readLock();
-            writeLock = lock.writeLock();
-        }
-
-        private int forkThread(int parent)
-        {
-            writeLock.lock();
-            try {
-                int child = newThread();
-                captures.copy(parent, child);
-                aggregations.copy(parent, child);
-                return child;
-            } finally {
-                writeLock.unlock();
-            }
-        }
-
-        private int newThread()
-        {
-            writeLock.lock();
-            try {
-                if (freeThreadIds.size() > 0) {
-                    return freeThreadIds.pop();
-                }
-                return newThreadId++;
-            } finally {
-                writeLock.unlock();
-            }
-        }
-
-        private void scheduleKill(int threadId)
-        {
-            writeLock.lock();
-            try {
-                threadsToKill.add(threadId);
-            } finally {
-                writeLock.unlock();
-            }
-        }
-
-        private void killThreads()
-        {
-            writeLock.lock();
-            try {
-                for (int i = 0; i < threadsToKill.size(); i++) {
-                    killThread(threadsToKill.get(i));
-                }
-                threadsToKill.clear();
-            } finally {
-                writeLock.unlock();
-            }
-        }
-
-        private void killThread(int threadId)
-        {
-            freeThreadIds.push(threadId);
-            captures.release(threadId);
-            aggregations.release(threadId);
-        }
-
-        private long getSizeInBytes()
-        {
-            readLock.lock();
-            try {
-                return INSTANCE_SIZE + threadsAtInstructions.getSizeInBytes() + threadsToKill.getSizeInBytes() + threads.getSizeInBytes() + freeThreadIds.getSizeInBytes() + captures.getSizeInBytes() + aggregations.getSizeInBytes();
-            } finally {
-                readLock.unlock();
-            }
-        }
-    }
-
-    public ParallelMatcher(Program program, List<List<PhysicalValueAccessor>> accessors, List<MatchAggregationLabelDependency> labelDependencies, List<MatchAggregationInstantiator> aggregations)
-    {
+    public ParallelMatcher(Program program, List<List<PhysicalValueAccessor>> accessors, List<MatchAggregationLabelDependency> labelDependencies, List<MatchAggregationInstantiator> aggregations) {
         super(program, accessors, labelDependencies, aggregations);
         this.program = program;
         this.threadEquivalence = new ThreadEquivalence(program, accessors, labelDependencies);
         this.aggregations = aggregations;
     }
 
-    private MatchResult flattenThreadsUntilDone(IntList[] currentThreads,  IntList current, ParallelRuntime runtime, MatchResult prevResult)
-    {
+    private MatchResult flattenThreadsUntilDone(IntList[] currentThreads, IntList current, ParallelRuntime runtime, MatchResult prevResult) {
         MatchResult result = prevResult;
         boolean isDone = false;
         for (int gid = 0; gid < currentThreads.length; gid++) {
@@ -176,30 +65,27 @@ public class ParallelMatcher extends Matcher
         return result;
     }
 
-    public MatchResult run(LabelEvaluator labelEvaluator, LocalMemoryContext memoryContext, AggregatedMemoryContext aggregationsMemoryContext)
-    {
+    public MatchResult run(LabelEvaluator labelEvaluator, LocalMemoryContext memoryContext, AggregatedMemoryContext aggregationsMemoryContext) {
         IntList current = new IntList(program.size());
-//        IntList next = new IntList(program.size());
 
         int inputLength = labelEvaluator.getInputLength();
         boolean matchingAtPartitionStart = labelEvaluator.isMatchingAtPartitionStart();
 
         ParallelRuntime runtime = new ParallelRuntime(program, inputLength, matchingAtPartitionStart, aggregations, aggregationsMemoryContext);
 
-        IntList[] nextThreads = new IntList[1];
-        nextThreads[0] = new IntList(program.size());
-        advanceAndSchedule(nextThreads[0], runtime.newThread(), 0, 0, runtime);
+        IntList[] nextThreadLists = new IntList[1];
+        nextThreadLists[0] = new IntList(program.size());
+        advanceAndSchedule(nextThreadLists[0], runtime.newThread(), 0, 0, runtime);
 
         // flatten the current lists into a single list
         MatchResult result = NO_MATCH;
-        result = flattenThreadsUntilDone(nextThreads, current, runtime, result);
+        result = flattenThreadsUntilDone(nextThreadLists, current, runtime, result);
 
         for (int index = 0; index < inputLength; index++) {
             if (current.size() == 0) {
                 // no match found -- all threads are dead
                 break;
             }
-//            boolean matched = false;
             // For every existing thread, consume the label if possible. Otherwise, kill the thread.
             // After consuming the label, advance to the next `MATCH_LABEL`. Collect the advanced threads in `next`,
             // which will be the starting point for the next iteration.
@@ -208,60 +94,76 @@ public class ParallelMatcher extends Matcher
             runtime.threadsAtInstructions.clear();
             runtime.killThreads();
 
-            nextThreads = new IntList[current.size()];
-            for (int i = 0; i < nextThreads.length; i++) {
-                nextThreads[i] = new IntList(program.size());
+            nextThreadLists = new IntList[current.size()];
+            for (int i = 0; i < nextThreadLists.length; i++) {
+                nextThreadLists[i] = new IntList(program.size());
             }
 
-            for (int i = 0; i < current.size(); i++) {
-                int threadId = current.get(i);
-                int pointer = runtime.threads.get(threadId);
-                Instruction instruction = program.at(pointer);
-                switch (instruction.type()) {
-                    case MATCH_LABEL:
-                        int label = ((MatchLabel) instruction).getLabel();
-                        // save the label before evaluating the defining condition, because evaluating assumes that the label is tentatively matched
-                        // - if the condition is true, the label is already saved
-                        // - if the condition is false, the thread is killed along with its captures, so the incorrectly saved label does not matter
-                        runtime.captures.saveLabel(threadId, label);
-                        if (labelEvaluator.evaluateLabel(runtime.captures.getLabels(threadId), runtime.aggregations.get(threadId))) {
-                            advanceAndSchedule(nextThreads[i], threadId, pointer + 1, index + 1, runtime);
-                        }
-                        else {
-                            runtime.scheduleKill(threadId);
-                        }
-                        break;
-//                    case DONE:
-//                        matched = true;
-//                        result = new MatchResult(true, runtime.captures.getLabels(threadId), runtime.captures.getCaptures(threadId));
-//                        runtime.scheduleKill(threadId);
-//                        break;
-                    default:
-                        throw new UnsupportedOperationException("not yet implemented");
-                }
-//                if (matched) {
-//                    // do not process the following threads, because they are on less preferred paths than the match found
-//                    for (int j = i + 1; j < current.size(); j++) {
-//                        runtime.scheduleKill(current.get(j));
-//                    }
-//                    break;
+            // Sequential Version
+//            for (int i = 0; i < current.size(); i++) {
+//                int threadId = current.get(i);
+//                int pointer = runtime.threads.get(threadId);
+//                Instruction instruction = program.at(pointer);
+////                switch (instruction.type()) {
+////                    case MATCH_LABEL:
+//                int label = ((MatchLabel) instruction).getLabel();
+//                // save the label before evaluating the defining condition, because evaluating assumes that the label is tentatively matched
+//                // - if the condition is true, the label is already saved
+//                // - if the condition is false, the thread is killed along with its captures, so the incorrectly saved label does not matter
+//                runtime.captures.saveLabel(threadId, label);
+//                if (labelEvaluator.evaluateLabel(runtime.captures.getLabels(threadId), runtime.aggregations.get(threadId))) {
+//                    advanceAndSchedule(nextThreadLists[i], threadId, pointer + 1, index + 1, runtime);
+//                } else {
+//                    runtime.scheduleKill(threadId);
 //                }
+////                        break;
+////                    default:
+////                        throw new UnsupportedOperationException("not yet implemented");
+////                }
+//            }
+
+            // Parallel Version
+            ExecutorService executor = Executors.newFixedThreadPool(current.size());
+
+            Future<?>[] futures = new Future[current.size()];
+            for (int i = 0; i < current.size(); i++) {
+                final int groupId = i;
+                final int threadId = current.get(i);
+                final int inputIndex = index;
+                final IntList nextThreadList = nextThreadLists[groupId];
+                Future<?> future = executor.submit(() -> {
+                    int pointer = runtime.threads.get(threadId);
+                    Instruction instruction = program.at(pointer);
+                    int label = ((MatchLabel) instruction).getLabel();
+                    runtime.captures.saveLabel(threadId, label);
+
+                    if (labelEvaluator.evaluateLabel(runtime.captures.getLabels(threadId), runtime.aggregations.get(threadId))) {
+                        advanceAndSchedule(nextThreadList, threadId, pointer + 1, inputIndex + 1, runtime);
+                    } else {
+                        runtime.scheduleKill(threadId);
+                    }
+
+                });
+                futures[i] = future;
+            }
+
+            for (Future<?> future : futures) {
+                try {
+                    future.get();
+                } catch (Exception e) {
+                    throw new RuntimeException("Parallel thread execution failed", e);
+                }
             }
 
             // report memory usage. memory is not reported for constant structures: program, threadEquivalence
             long nextSize = 0;
-            for (IntList next : nextThreads) {
+            for (IntList next : nextThreadLists) {
                 nextSize += next.size();
             }
             memoryContext.setBytes(runtime.getSizeInBytes() + current.getSizeInBytes() + nextSize);
 
-//            IntList temp = current;
-//            temp.clear();
-//            current = next;
-//            next = temp;
-
             current.clear();
-            result = flattenThreadsUntilDone(nextThreads, current, runtime, result);
+            result = flattenThreadsUntilDone(nextThreadLists, current, runtime, result);
         }
 
         // handle the case when the program still has instructions to process after consuming the whole input
@@ -282,8 +184,7 @@ public class ParallelMatcher extends Matcher
      * The resulting thread state (the pointer of the first not processed instruction) is recorded in `next`.
      * There might be multiple threads recorded in `next`, as a result of the instruction `SPLIT`.
      */
-    private void advanceAndSchedule(IntList next, int threadId, int pointer, int inputIndex, ParallelRuntime runtime)
-    {
+    private void advanceAndSchedule(IntList next, int threadId, int pointer, int inputIndex, ParallelRuntime runtime) {
         // avoid empty loop and try avoid exponential processing
         ArrayView threadsAtInstruction = runtime.threadsAtInstructions.getArrayView(pointer);
         for (int i = 0; i < threadsAtInstruction.length(); i++) {
@@ -308,16 +209,14 @@ public class ParallelMatcher extends Matcher
             case MATCH_START:
                 if (inputIndex == 0 && runtime.matchingAtPartitionStart) {
                     advanceAndSchedule(next, threadId, pointer + 1, inputIndex, runtime);
-                }
-                else {
+                } else {
                     runtime.scheduleKill(threadId);
                 }
                 break;
             case MATCH_END:
                 if (inputIndex == runtime.inputLength) {
                     advanceAndSchedule(next, threadId, pointer + 1, inputIndex, runtime);
-                }
-                else {
+                } else {
                     runtime.scheduleKill(threadId);
                 }
                 break;
@@ -337,6 +236,107 @@ public class ParallelMatcher extends Matcher
                 runtime.threads.set(threadId, pointer);
                 next.add(threadId);
                 break;
+        }
+    }
+
+    protected static class ParallelRuntime {
+        private static final int INSTANCE_SIZE = instanceSize(java.lang.Runtime.class);
+
+        // a helper structure for identifying equivalent threads
+        // program pointer (instruction) --> list of threads that have reached this instruction
+        private final IntMultimap threadsAtInstructions;
+        // threads that should be killed as determined by the current iteration of the main loop
+        // they are killed after the iteration so that they can be used to kill other threads while the iteration lasts
+        private final IntList threadsToKill;
+
+        private final IntList threads;
+        private final IntStack freeThreadIds;
+        private final int inputLength;
+        private final boolean matchingAtPartitionStart;
+        private final Captures captures;
+        // for each thread, array of MatchAggregations evaluated by this thread
+        private final MatchAggregations aggregations;
+        // Read-write lock for thread safety
+        private final ReentrantReadWriteLock lock;
+        private final ReentrantReadWriteLock.ReadLock readLock;
+        private final ReentrantReadWriteLock.WriteLock writeLock;
+        private int newThreadId;
+
+        public ParallelRuntime(Program program, int inputLength, boolean matchingAtPartitionStart, List<MatchAggregationInstantiator> aggregationInstantiators, AggregatedMemoryContext aggregationsMemoryContext) {
+            int initialCapacity = 2 * program.size();
+            threads = new IntList(initialCapacity);
+            freeThreadIds = new IntStack(initialCapacity);
+            this.captures = new Captures(initialCapacity, program.getMinSlotCount(), program.getMinLabelCount());
+            this.inputLength = inputLength;
+            this.matchingAtPartitionStart = matchingAtPartitionStart;
+            this.aggregations = new MatchAggregations(initialCapacity, aggregationInstantiators, aggregationsMemoryContext);
+
+            this.threadsAtInstructions = new IntMultimap(program.size(), program.size());
+            this.threadsToKill = new IntList(initialCapacity);
+
+            this.lock = new ReentrantReadWriteLock();
+            readLock = lock.readLock();
+            writeLock = lock.writeLock();
+        }
+
+        private int forkThread(int parent) {
+            writeLock.lock();
+            try {
+                int child = newThread();
+                captures.copy(parent, child);
+                aggregations.copy(parent, child);
+                return child;
+            } finally {
+                writeLock.unlock();
+            }
+        }
+
+        private int newThread() {
+            writeLock.lock();
+            try {
+                if (freeThreadIds.size() > 0) {
+                    return freeThreadIds.pop();
+                }
+                return newThreadId++;
+            } finally {
+                writeLock.unlock();
+            }
+        }
+
+        private void scheduleKill(int threadId) {
+            writeLock.lock();
+            try {
+                threadsToKill.add(threadId);
+            } finally {
+                writeLock.unlock();
+            }
+        }
+
+        private void killThreads() {
+            writeLock.lock();
+            try {
+                for (int i = 0; i < threadsToKill.size(); i++) {
+                    killThread(threadsToKill.get(i));
+                }
+                threadsToKill.clear();
+            } finally {
+                writeLock.unlock();
+            }
+        }
+
+        private void killThread(int threadId) {
+            freeThreadIds.push(threadId);
+            captures.release(threadId);
+            aggregations.release(threadId);
+        }
+
+        private long getSizeInBytes() {
+            readLock.lock();
+            try {
+                return INSTANCE_SIZE + threadsAtInstructions.getSizeInBytes() + threadsToKill.getSizeInBytes() + threads.getSizeInBytes() + freeThreadIds.getSizeInBytes() + captures.getSizeInBytes() + aggregations.getSizeInBytes();
+            } finally {
+                readLock.unlock();
+            }
         }
     }
 }
