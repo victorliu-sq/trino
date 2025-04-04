@@ -26,7 +26,7 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
 import static io.airlift.slice.SizeOf.instanceSize;
 import static io.trino.operator.window.matcher.MatchResult.NO_MATCH;
 
-public class ParallelMatcher
+public class ParallelMatcher extends Matcher
 {
     private final Program program;
     private final ThreadEquivalence threadEquivalence;
@@ -145,6 +145,7 @@ public class ParallelMatcher
 
     public ParallelMatcher(Program program, List<List<PhysicalValueAccessor>> accessors, List<MatchAggregationLabelDependency> labelDependencies, List<MatchAggregationInstantiator> aggregations)
     {
+        super(program, accessors, labelDependencies, aggregations);
         this.program = program;
         this.threadEquivalence = new ThreadEquivalence(program, accessors, labelDependencies);
         this.aggregations = aggregations;
