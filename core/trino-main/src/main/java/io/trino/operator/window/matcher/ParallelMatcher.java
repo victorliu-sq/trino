@@ -151,8 +151,9 @@ public class ParallelMatcher extends Matcher
         this.aggregations = aggregations;
     }
 
-    private void flattenThreadsUntilDone(IntList[] currentThreads,  IntList current, ParallelRuntime runtime, MatchResult matchResult)
+    private MatchResult flattenThreadsUntilDone(IntList[] currentThreads,  IntList current, ParallelRuntime runtime, MatchResult prevResult)
     {
+        MatchResult result = prevResult;
         boolean isDone = false;
         for (int gid = 0; gid < currentThreads.length; gid++) {
             for (int tid = 0; tid < currentThreads[gid].size(); tid++) {
@@ -163,16 +164,16 @@ public class ParallelMatcher extends Matcher
                     // first DONE
                     if (instruction.type() == Instruction.Type.DONE) {
                         isDone = true;
-                        matchResult = new MatchResult(true, runtime.captures.getLabels(threadId), runtime.captures.getCaptures(threadId));
+                        result = new MatchResult(true, runtime.captures.getLabels(threadId), runtime.captures.getCaptures(threadId));
                     } else {
                         current.add(threadId);
                     }
                 } else {
                     runtime.scheduleKill(threadId);
                 }
-
             }
         }
+        return result;
     }
 
     public MatchResult run(LabelEvaluator labelEvaluator, LocalMemoryContext memoryContext, AggregatedMemoryContext aggregationsMemoryContext)
@@ -191,7 +192,7 @@ public class ParallelMatcher extends Matcher
 
         // flatten the current lists into a single list
         MatchResult result = NO_MATCH;
-        flattenThreadsUntilDone(nextThreads, current, runtime, result);
+        result = flattenThreadsUntilDone(nextThreads, current, runtime, result);
 
         for (int index = 0; index < inputLength; index++) {
             if (current.size() == 0) {
@@ -204,10 +205,13 @@ public class ParallelMatcher extends Matcher
             // which will be the starting point for the next iteration.
 
             // clear the structure for new input index
-//            runtime.threadsAtInstructions.clear();
-//            runtime.killThreads();
+            runtime.threadsAtInstructions.clear();
+            runtime.killThreads();
 
             nextThreads = new IntList[current.size()];
+            for (int i = 0; i < nextThreads.length; i++) {
+                nextThreads[i] = new IntList(program.size());
+            }
 
             for (int i = 0; i < current.size(); i++) {
                 int threadId = current.get(i);
@@ -257,7 +261,7 @@ public class ParallelMatcher extends Matcher
 //            next = temp;
 
             current.clear();
-            flattenThreadsUntilDone(nextThreads, current, runtime, result);
+            result = flattenThreadsUntilDone(nextThreads, current, runtime, result);
         }
 
         // handle the case when the program still has instructions to process after consuming the whole input
